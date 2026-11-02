@@ -292,6 +292,16 @@ GOOGLE_CLIENT_SECRET = os.getenv('GOOGLE_CLIENT_SECRET')
 GOOGLE_REDIRECT_URI = os.getenv('GOOGLE_OAUTH_CALLBACK_URL') or os.getenv('GOOGLE_REDIRECT_URI')
 NEXTGENDEM_BASE_URL = os.getenv('NEXTGENDEM_BASE_URL', "https://sys.nextgendem.eu")
 
+# USE_KEYCLOAK=true: the "Continue with Google" button goes through the Nesomic Keycloak realm (client
+# nesomic-hub, Google identity provider behind it, kc_idp_hint=google so the Keycloak page is skipped)
+# instead of Google OAuth directly. Same callback URL (GOOGLE_OAUTH_CALLBACK_URL). The session username
+# stays Google's user id, which Keycloak exposes as the "google_id" claim, so per-user resources carry over.
+USE_KEYCLOAK = os.getenv('USE_KEYCLOAK', 'false').strip().lower() in ('1', 'true', 'yes')
+OIDC_ISSUER = (os.getenv('OIDC_ISSUER') or '').rstrip('/')                       # public: browser redirects
+OIDC_INTERNAL_URL = (os.getenv('OIDC_INTERNAL_URL') or OIDC_ISSUER).rstrip('/')  # in-cluster: token / userinfo
+KEYCLOAK_CLIENT_ID = os.getenv('KEYCLOAK_CLIENT_ID', 'nesomic-hub')
+KEYCLOAK_CLIENT_SECRET = os.getenv('KEYCLOAK_CLIENT_SECRET')
+
 # logger.info("--- Google OAuth Configuration ---")
 # logger.info(f"GOOGLE_CLIENT_ID: {GOOGLE_CLIENT_ID}")
 # logger.info(f"GOOGLE_CLIENT_SECRET: {GOOGLE_CLIENT_SECRET}")
@@ -305,6 +315,18 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 @app.post("/login/google")
 async def login_google():
+    if USE_KEYCLOAK:
+        logger.info(f"Initiating Keycloak login ({OIDC_ISSUER}) with redirect_uri: {GOOGLE_REDIRECT_URI}")
+        # 303: the login form reaches here by POST and a 307 would re-POST the form to Keycloak, which
+        # then rejects the request ("Parameter 'client_id' not present or present multiple times")
+        return RedirectResponse(status_code=303, url=(
+            f"{OIDC_ISSUER}/protocol/openid-connect/auth?"
+            f"client_id={KEYCLOAK_CLIENT_ID}&"
+            f"redirect_uri={GOOGLE_REDIRECT_URI}&"
+            f"scope=openid%20email%20profile&"
+            f"response_type=code&"
+            f"kc_idp_hint=google"
+        ))
     logger.info(f"Initiating Google OAuth login with redirect_uri: {GOOGLE_REDIRECT_URI}")
     google_auth_url = (
         f"https://accounts.google.com/o/oauth2/auth?"
@@ -400,34 +422,73 @@ def authorize_session_request(request, session_id, require_sys_admin=False):
 # Also creates the session (ID: Google User ID) if it's autenthicated
 # Redirects to other function with the HTML responses
         
-@app.get("/oauth2/callback")
-async def auth_google(code: str, request: Request):
-    logger.info(f"Received Google OAuth callback. Exchanging code for token with redirect_uri: {GOOGLE_REDIRECT_URI}")
-    token_url = "https://accounts.google.com/o/oauth2/token"
+def _keycloak_user_info(code):
+    """
+    Code exchange + userinfo against the Keycloak realm, returned in the shape the Google branch produces
+    (id / email / verified_email / name) so the rest of the callback is shared. None on failure
+    """
+    provider = "Keycloak"
     data = {
         "code": code,
-        "client_id": GOOGLE_CLIENT_ID,
-        "client_secret": GOOGLE_CLIENT_SECRET,
+        "client_id": KEYCLOAK_CLIENT_ID,
+        "client_secret": KEYCLOAK_CLIENT_SECRET,
         "redirect_uri": GOOGLE_REDIRECT_URI,
         "grant_type": "authorization_code",
     }
-    response = requests.post(token_url, data=data, timeout=10)
+    response = requests.post(f"{OIDC_INTERNAL_URL}/protocol/openid-connect/token", data=data, timeout=10)
     if response.status_code != 200:
-        logger.error(f"Google Token Exchange Error. Status: {response.status_code}, Body: {response.text}")
-        return HTMLResponse(content="Login Failed: Google Token Exchange Error", status_code=401)
-    
-    logger.info("Google Token Exchange successful.")
+        logger.error(f"{provider} Token Exchange Error. Status: {response.status_code}, Body: {response.text}")
+        return None
     access_token = response.json().get("access_token")
-    user_info_url = "https://www.googleapis.com/oauth2/v1/userinfo"
-    logger.info(f"Requesting user info from {user_info_url}")
-    request_info = requests.get(user_info_url, headers={"Authorization": f"Bearer {access_token}"}, timeout=10)
-    logger.info(f"User info response status: {request_info.status_code}")
-
+    request_info = requests.get(f"{OIDC_INTERNAL_URL}/protocol/openid-connect/userinfo",
+                                headers={"Authorization": f"Bearer {access_token}"}, timeout=10)
     if request_info.status_code != 200:
-        logger.error(f"Failed to get user info. Body: {request_info.text}")
-        return HTMLResponse(content="Login Failed: Could not retrieve user info", status_code=401)
+        logger.error(f"{provider}: failed to get user info. Body: {request_info.text}")
+        return None
+    claims = request_info.json()
+    return {
+        "id": claims.get("google_id") or claims.get("sub"),
+        "email": claims.get("email"),
+        "verified_email": bool(claims.get("email_verified", False)),
+        "name": claims.get("name") or claims.get("preferred_username"),
+        "picture": claims.get("picture"),
+    }
 
-    user_info = request_info.json()
+
+@app.get("/oauth2/callback")
+async def auth_google(code: str, request: Request):
+    if USE_KEYCLOAK:
+        logger.info(f"Received Keycloak callback. Exchanging code for token with redirect_uri: {GOOGLE_REDIRECT_URI}")
+        user_info = _keycloak_user_info(code)
+        if user_info is None or not user_info.get("email"):
+            return HTMLResponse(content="Login Failed: Keycloak Token Exchange Error", status_code=401)
+    else:
+        logger.info(f"Received Google OAuth callback. Exchanging code for token with redirect_uri: {GOOGLE_REDIRECT_URI}")
+        token_url = "https://accounts.google.com/o/oauth2/token"
+        data = {
+            "code": code,
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "redirect_uri": GOOGLE_REDIRECT_URI,
+            "grant_type": "authorization_code",
+        }
+        response = requests.post(token_url, data=data, timeout=10)
+        if response.status_code != 200:
+            logger.error(f"Google Token Exchange Error. Status: {response.status_code}, Body: {response.text}")
+            return HTMLResponse(content="Login Failed: Google Token Exchange Error", status_code=401)
+
+        logger.info("Google Token Exchange successful.")
+        access_token = response.json().get("access_token")
+        user_info_url = "https://www.googleapis.com/oauth2/v1/userinfo"
+        logger.info(f"Requesting user info from {user_info_url}")
+        request_info = requests.get(user_info_url, headers={"Authorization": f"Bearer {access_token}"}, timeout=10)
+        logger.info(f"User info response status: {request_info.status_code}")
+
+        if request_info.status_code != 200:
+            logger.error(f"Failed to get user info. Body: {request_info.text}")
+            return HTMLResponse(content="Login Failed: Could not retrieve user info", status_code=401)
+
+        user_info = request_info.json()
     user_email = user_info["email"]
     logger.info(f"User authenticated: {user_email}")
 

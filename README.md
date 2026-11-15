@@ -285,10 +285,14 @@ For more information about the libraries used, check:
 
 Contributions are welcome. If you wish to collaborate, please open an **issue** or a **pull request**.
 
-## License
+## License, authors and funding
 
-This project is licensed under the BSD 3-Clause License, the same as the rest of the NEXTGENDEM / NESOMIC
-platform. See the `LICENSE` file.
+BSD 3-Clause License, the same as the rest of the NESOMIC platform: see `LICENSE`. Copyright
+belongs to the NESOMIC authors listed in `AUTHORS`.
+
+Developed within the NEXTGENDEM project (https://www.nextgendem.eu), funded by the Interreg MAC
+2014-2020 Cooperation Programme (project code MAC2/4.6d/236), and continued under a commission
+from the Cabildo de Gran Canaria.
 
 # Code Organization:
 

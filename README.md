@@ -287,7 +287,8 @@ Contributions are welcome. If you wish to collaborate, please open an **issue** 
 
 ## License
 
-This project is licensed under the MIT License. For more details, please refer to the `LICENSE` file.
+This project is licensed under the BSD 3-Clause License, the same as the rest of the NEXTGENDEM / NESOMIC
+platform. See the `LICENSE` file.
 
 # Code Organization:
 
